@@ -1,0 +1,5 @@
+boto3
+simplejson
+pytz
+sentencepiece
+openai
