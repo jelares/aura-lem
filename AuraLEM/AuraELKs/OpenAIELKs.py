@@ -21,8 +21,7 @@ def synthesize_response(cw_response, cw_config, um, tokenizer, connectionId, con
   system_message += json.dumps(uds)
 
   # Get API key from environment
-  # openai_key = os.environ['openai_key']
-  openai_key = "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"
+  openai_key = os.environ['openai_key']
   openai_client = OpenAI(api_key=openai_key)
 
   # Specify the AI model

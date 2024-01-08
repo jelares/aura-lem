@@ -22,8 +22,7 @@ def analyze_async(event, context):
   print("message history: ", message_history, "\n\n")
 
   # Get API key from environment
-  # openai_key = os.environ['openai_key']
-  openai_key = "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"
+  openai_key = os.environ['openai_key']
   openai_client = OpenAI(api_key=openai_key)
   
   # Specify the AI model
