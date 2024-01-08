@@ -1,15 +1,15 @@
-import sentencepiece as spm
+import tiktoken
 
-class LLAMASentiencePiece():
+class OpenAITokenizer():
   def __init__(self, token_type):
     # make sure the LEMChat knows this is the token type it is using
-    assert token_type == "LLAMASentencePieceBytePairEncoding"
-    self.token_type = "LLAMASentencePieceBytePairEncoding"
-    self.tokenizer = spm.SentencePieceProcessor('AuraLEM/Tokenizers/tokenizer.model')
+    assert (token_type == "cl100k_base")
+    self.token_type = "cl100k_base"
+    self.tokenizer = tiktoken.get_encoding("cl100k_base")
 
   
   def calculate_tokenized_length(self, text):
-    tokens = self.tokenizer.encode(text, out_type=str)
+    tokens = self.tokenizer.encode(text)
     return len(tokens)
   
 
@@ -29,7 +29,7 @@ class LLAMASentiencePiece():
 
 ### testing
 # def main():
-#   tokenizer = Tokenizer("LLAMASentencePieceBytePairEncoding")
+#   tokenizer = Tokenizer("cl100k_base")
 
 #   # while True:
 #     # text = input("Enter text to tokenize: ")

@@ -1,139 +1,81 @@
 import simplejson as json
 import boto3
 from LEMChatUtilities import *
-from AuraELKs.OpenAIELKs import ELKs
-from AuraELAM.OpenAIELAM import batch_analyze
-from Tokenizers.LLAMASentiencePiece import Tokenizer
-from LEMTestUtilities import FakeConn
+from AuraELAM.OpenAIELAM import analyze
+from CW_configs import get_cw_config
+from Tokenizers.Tokenizer import Tokenizer
+from AuraELKs.OpenAIELKs import synthesize_response
 
 # conn = boto3.client("apigatewaymanagementapi", endpoint_url="https://bvm4vv2jm6.execute-api.us-east-1.amazonaws.com/dev")
+from LEMTestUtilities import FakeConn
 conn = FakeConn()
-client = boto3.resource('dynamodb')
-table = client.Table('UserData')
 
 # top-level LEM config
-token_type = "LLAMASentencePieceBytePairEncoding" # the type of tokens used
+# cw_config = get_cw_config('production')
+cw_config = get_cw_config('local_test_small')
 
-# context window size breakdown
-# ctx_ws = 4096 # the context window size
-# response_mtl = 500 # the max length of the response (in tokens of token_type)
-# um_mtl = 500 # the max length of the user input (in tokens)
-# ch_mtl = 1596 # max length of chat history (in tokens)
-# uds_mtl = 1480 # max length of context information: system message, UDS & IDS (in tokens)
-# wiggle_room = 20 # the amount of wiggle room allowed for the context window (in tokens)
-
-ctx_ws = 100 # the context window size
-response_mtl = 20 # the max length of the response (in tokens of token_type)
-um_mtl = 20 # the max length of the user input (in tokens)
-ch_mtl = 50 # max length of chat history (in tokens)
-uds_mtl = 50 # max length of context information: system message, UDS & IDS (in tokens)
-wiggle_room = 10 # the amount of wiggle room allowed for the context window (in tokens)
-
-# the max length of the analysis window (in tokens)
-# aw_mtl = 1596
-
-aw_mtl = 50
-
-# create the tokenizer 
-ELKs = ELKs()
-tokenizer = Tokenizer(token_type)
+# note: tokenizer may have multiple sub-tokenizers
+tokenizer = Tokenizer({cw_config["elks_token_type"], cw_config["elam_token_type"]})
 
 def lambda_handler(event, context):
+  '''
+  INVARIENTS:
+  elam_tl(aw) <= what ddb stores as: context_window_meta["elam_aw_mtl"].
+  In other words, the analysis window token length will always be at least smaller than the previous
+  analysis window limit, even if it has just been changed to be smaller in this current iteration.
+  '''
+  
   # Get data from request
   connectionId = event["requestContext"]["connectionId"]
 
   # Load the user query
   body = json.loads(event["body"])
 
-  # uid and iid uniquely identify a communication thread for a given api key
-  api_key = str(body["sub"])
-  uid = str(body["uid"])
-  iid = str(body["iid"])
-  um = {"content": str(body["user_message"]), "role": "user", "uid": uid, "iid": iid}
+  try:
+    api_key = str(body["sub"])
+    uid = str(body["uid"]) # uid and iid uniquely identify a communication thread for a given api key
+    iid = str(body["iid"])
+    um_content = str(body["user_message"])
+    force_reflect = bool(body["force_reflect"])
+  except Exception as e:
+    return {
+      'statusCode': 400,
+      'body': json.dumps(f'Error in request body: {str(e)}')
+    }
 
-  um_tl = tokenizer.calculate_tokenized_length(um["content"])
+  # creates the user message from only text content
+  um = message_from_content(um_content, api_key, uid, iid, tokenizer)
 
-  # checkpoint 1: tokenizer counter works
-  print("tl of message: ", um_tl, "\n\n")
+  # validates inputs
+  input_validation_response = validate_inputs(um, force_reflect, cw_config)
+  if input_validation_response["statusCode"] != 200: return input_validation_response["response"]
 
-  um["token_length"] = um_tl
-  um["token_type"] = token_type
-  um["sortk"] = get_sortk_timestamp()
-  um["partitionk"] = api_key + uid + iid + 'messages'
+  # get context window metadata 
+  cwm_response = get_context_window_meta(api_key, uid, iid, cw_config)
 
-  # Idempotency check - check if the process is already active for this user and intelligence
-  idempotency_key = api_key + uid + iid + "idempotency_key"
-  lock_already_active, idempotency_response = check_then_activate_idempotency_lock(idempotency_key, table)
-  if lock_already_active:
-    return idempotency_response
+  # checks idempotency locks: if locked, returns, else locks for the remainder of communication
+  idempotency_response = idempotency_lock(cwm_response)
+  if idempotency_response["statusCode"] != 200: return idempotency_response["response"]
 
-  um_invalid, invalid_um_response = validate_user_message(um, um_mtl)
-  if um_invalid:
-    return invalid_um_response
+  # uses cw meta to get all context: UDS, analysis & chat windows.
+  cw_response = get_context_window(cwm_response)
 
-  # get the communication meta information
-  context_window_meta = get_context_window_meta(api_key, uid, iid, table, token_type, boto3)
+  # if necessary, validates all context window data & meta-data
+  cw_response, cwm_response = validate_context_window(cw_response, cwm_response, tokenizer)
+  
+  # synthesizes all context into an intelligence response, streams to the user
+  im = synthesize_response(cw_response, cw_config, um, tokenizer, connectionId, conn)
 
-  # checkpoint 2: context_window_meta works
-  print("context window meta: ", context_window_meta, "\n\n")
+  # updates ch_meta, ch & aw window, returns anything needed for analysis
+  analysis_input, context_window_meta = update_context_window(cwm_response, cw_response, cw_config, um, im, force_reflect)
 
-  # get analysis & context window messages
-  analysis_window, chat_history = get_analysis_and_chat_windows(context_window_meta, api_key, uid, iid, table, boto3)
+  # synchronizes ddb state & unlocks the data for future manipulation.  Unlocks idempotency lock.
+  synchronize_ddb(context_window_meta, um, im)
 
-  # checkpoint 3
-  # print("analysis window: ", analysis_window, "\n\n")
-  # print("chat history: ", chat_history, "\n\n")
-
-  # validate the analysis & chat windows, and the context_window_meta objects. Namely, their tokenization is up to date
-  context_window_meta, analysis_window, chat_history, token_type_updated = validate_windows_and_meta(context_window_meta, analysis_window, chat_history, token_type, tokenizer, ch_mtl)
-
-  # edge case: if the token type of chat history and analyis window were not up to date, make them so in ddb (for analysis)
-  if(token_type_updated):
-    ch_extending_analysis_window = chat_history.extends(analysis_window)
-    add_messages_ddb(ch_extending_analysis_window, table)
-
-  # make the ELKs call after all system configuration
-  message_context = get_context(api_key, uid, iid, table, boto3) # MVP: UDS
-
-  print("Context: ", message_context, "\n\n")
-
-  # synthesize the resopnse & stream it back to the user during building
-  im = ELKs.synthesize_response(chat_history, um, message_context, connectionId, conn)
-  im_tl = tokenizer.calculate_tokenized_length(im["content"])
-  im["token_length"] = im_tl
-  im["token_type"] = token_type
-  im["sortk"] = get_sortk_timestamp()
-  im["partitionk"] = api_key + uid + iid + 'messages'
-  im["uid"] = uid
-  im["iid"] = iid
-
-  # update the chat history with the new user message, intelligence message, and keep context_window_meta synced
-  context_window_meta, chat_history = update_chat_history(context_window_meta, chat_history, um, im, ch_mtl)
-
-  # add the current messages to dynamodb
-  add_messages_ddb([um, im], table)
-
-  # update analysis window - add the two new messages for analysis
-  context_window_meta, analysis_window, batches_to_analyze = update_analysis_window(context_window_meta, um, im, analysis_window, aw_mtl, api_key, uid, iid)
-
-  # update the context window meta in dynamodb
-  add_message_ddb(context_window_meta, table)
-
-  print("\n\nNew context_window_meta: ", context_window_meta, "\n\n")
-  print("Batches to analyze: ", batches_to_analyze, "\n\n")
-
-  # Clear the active flag
-  table.put_item(Item={'partitionk': idempotency_key, 'sortk': get_sortk_timestamp(), 'active': True})
-
-  # at this point, the only messages left in the aw have sum token length less than the acceptable aw_mtl
-  # batches_to_analyze may be empty if the aw is still being built up (has not exceeded aw_mtl), in which case ELAM does nothing
-
-  # in prod this will be a call to activate a lambda step function
-  # Map state accepts a JSON array as input. It executes the same workflow steps for each element of the array.
-  batch_analyze(batches_to_analyze) # ASYNC
+  # syncronously if force_analyze = true, asyncronously if prompted by analysis-window.
+  analysis_response = analyze(analysis_input)
 
   return {
     'statusCode': 200,
-    'body': json.dumps('Request processed successfully')
+    'body': json.dumps('Communication Instance completed successfully. Data unlocked.')
   }
-  
