@@ -101,7 +101,7 @@ Practice testing the LEM system.
 
 def main():
     # reset_context_window_meta()
-    # update_idempotency_lock()
+    update_idempotency_lock()
     run_test(False)
 
 
